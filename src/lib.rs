@@ -237,7 +237,7 @@ impl Config {
     #[cfg(feature = "json_types")]
     pub fn add_json_type_override<P>(self, path: P, json_type: JsonArray) -> Self
     where
-        P: Into<PathMatcher>
+        P: Into<PathMatcher>,
     {
         let mut conf = self;
 
@@ -247,10 +247,7 @@ impl Config {
             }
             #[cfg(feature = "regex_path")]
             PathMatcher::Regex(regex) => {
-                conf.json_regex_type_overrides.push((
-                    regex,
-                    json_type
-                ));
+                conf.json_regex_type_overrides.push((regex, json_type));
             }
         }
 
@@ -314,115 +311,97 @@ fn parse_text(text: &str, leading_zero_as_string: bool, json_type: &JsonType) ->
     Value::String(text.into())
 }
 
-/// Converts an XML Element into a JSON property
+/// Converts an XML Element into a JSON property.
+///
+/// 修改后的逻辑：无论文本是否存在，都将递归处理子节点；
+/// 如果同时存在非空文本和其他属性/子节点，则将文本值放在配置的文本属性名下，
 fn convert_node(el: &Element, config: &Config, path: &String) -> Option<Value> {
-    // add the current node to the path
+    // 更新当前路径：例如 "/a" 变成 "/a/当前节点名"
     #[cfg(feature = "json_types")]
-    let path = [path, "/", el.name()].concat();
+    let current_path = [path, "/", el.name()].concat();
+    #[cfg(not(feature = "json_types"))]
+    let current_path = [path, "/", el.name()].concat();
 
-    // get the json_type for this node
-    let (_, json_type_value) = get_json_type(config, &path);
+    // 获取当前节点应应用的 JSON 类型
+    let (_, json_type_value) = get_json_type(config, &current_path);
+    let binding = el.text();
+    let trimmed_text = binding.trim();
 
-    // is it an element with text?
-    if el.text().trim() != "" {
-        // process node's attributes, if present
-        if el.attrs().count() > 0 {
-            Some(Value::Object(
-                el.attrs()
-                    .map(|(k, v)| {
-                        // add the current node to the path
-                        #[cfg(feature = "json_types")]
-                        let path = [path.clone(), "/@".to_owned(), k.to_owned()].concat();
-                        // get the json_type for this node
-                        #[cfg(feature = "json_types")]
-                        let (_, json_type_value) = get_json_type(config, &path);
-                        (
-                            [config.xml_attr_prefix.clone(), k.to_owned()].concat(),
-                            parse_text(&v, config.leading_zero_as_string, &json_type_value),
-                        )
-                    })
-                    .chain(vec![(
-                        config.xml_text_node_prop_name.clone(),
-                        parse_text(
-                            &el.text()[..],
-                            config.leading_zero_as_string,
-                            &json_type_value,
-                        ),
-                    )])
-                    .collect(),
-            ))
-        } else {
-            Some(parse_text(
-                &el.text()[..],
-                config.leading_zero_as_string,
-                &json_type_value,
-            ))
-        }
-    } else {
-        // this element has no text, but may have other child nodes
-        let mut data = Map::new();
+    let mut data = Map::new();
 
-        for (k, v) in el.attrs() {
-            // add the current node to the path
+    // 处理属性
+    for (k, v) in el.attrs() {
+        #[cfg(feature = "json_types")]
+        let attr_path = [current_path.clone(), "/@".to_owned(), k.to_owned()].concat();
+        #[cfg(not(feature = "json_types"))]
+        let attr_path = current_path.clone();
+        let (_, json_type_value_attr) = get_json_type(config, &attr_path);
+        data.insert(
+            format!("{}{}", config.xml_attr_prefix, k),
+            parse_text(v, config.leading_zero_as_string, &json_type_value_attr),
+        );
+    }
+
+    // 递归处理所有子元素
+    for child in el.children() {
+        if let Some(child_val) = convert_node(child, config, &current_path) {
+            let child_name = child.name().to_string();
             #[cfg(feature = "json_types")]
-            let path = [path.clone(), "/@".to_owned(), k.to_owned()].concat();
-            // get the json_type for this node
-            #[cfg(feature = "json_types")]
-            let (_, json_type_value) = get_json_type(config, &path);
-            data.insert(
-                [config.xml_attr_prefix.clone(), k.to_owned()].concat(),
-                parse_text(&v, config.leading_zero_as_string, &json_type_value),
-            );
-        }
-
-        // process child element recursively
-        for child in el.children() {
-            match convert_node(child, config, &path) {
-                Some(val) => {
-                    let name = &child.name().to_string();
-
-                    #[cfg(feature = "json_types")]
-                    let path = [path.clone(), "/".to_owned(), name.clone()].concat();
-                    let (json_type_array, _) = get_json_type(config, &path);
-                    // does it have to be an array?
-                    if json_type_array || data.contains_key(name) {
-                        // was this property converted to an array earlier?
-                        if data.get(name).unwrap_or(&Value::Null).is_array() {
-                            // add the new value to an existing array
-                            data.get_mut(name)
-                                .unwrap()
-                                .as_array_mut()
-                                .unwrap()
-                                .push(val);
+            let child_path = [current_path.clone(), "/".to_owned(), child_name.clone()].concat();
+            #[cfg(not(feature = "json_types"))]
+            let child_path = current_path.clone();
+            let (json_array_flag, _) = get_json_type(config, &child_path);
+            if json_array_flag || data.contains_key(&child_name) {
+                // 如果该属性已存在，则转为数组或追加到已有数组中
+                let new_val = match data.remove(&child_name) {
+                    Some(existing) => {
+                        if let Value::Array(mut arr) = existing {
+                            arr.push(child_val);
+                            arr
                         } else {
-                            // convert the property to an array with the existing and the new values
-                            let new_val = match data.remove(name) {
-                                None => vec![val],
-                                Some(temp) => vec![temp, val],
-                            };
-                            data.insert(name.clone(), Value::Array(new_val));
+                            vec![existing, child_val]
                         }
-                    } else {
-                        // this is the first time this property is encountered and it doesn't
-                        // have to be an array, so add it as-is
-                        data.insert(name.clone(), val);
                     }
-                }
-                _ => (),
+                    None => vec![child_val],
+                };
+                data.insert(child_name, Value::Array(new_val));
+            } else {
+                data.insert(child_name, child_val);
             }
         }
+    }
 
-        // return the JSON object if it's not empty
+    // 如果文本内容非空：
+    if !trimmed_text.is_empty() {
         if !data.is_empty() {
-            return Some(Value::Object(data));
+            // 若同时存在属性或子元素，则将文本内容以特定属性名插入
+            data.insert(
+                config.xml_text_node_prop_name.clone(),
+                parse_text(
+                    trimmed_text,
+                    config.leading_zero_as_string,
+                    &json_type_value,
+                ),
+            );
+        } else {
+            // 如果仅有文本，直接返回文本值
+            return Some(parse_text(
+                trimmed_text,
+                config.leading_zero_as_string,
+                &json_type_value,
+            ));
         }
+    }
 
-        // empty objects are treated according to config rules set by the caller
-        match config.empty_element_handling {
-            NullValue::Null => Some(Value::Null),
-            NullValue::EmptyObject => Some(Value::Object(data)),
-            NullValue::Ignore => None,
-        }
+    if !data.is_empty() {
+        return Some(Value::Object(data));
+    }
+
+    // 空元素的处理：依据配置返回 Null、空对象或忽略
+    match config.empty_element_handling {
+        NullValue::Null => Some(Value::Null),
+        NullValue::EmptyObject => Some(Value::Object(data)),
+        NullValue::Ignore => None,
     }
 }
 
@@ -451,11 +430,14 @@ pub fn xml_string_to_json(xml: String, config: &Config) -> Result<Value, Error> 
 /// in the list of paths with custom config.
 #[cfg(feature = "json_types")]
 #[inline]
-fn get_json_type_with_absolute_path<'conf>(config: &'conf Config, path: &String) -> (bool, &'conf JsonType) {
+fn get_json_type_with_absolute_path<'conf>(
+    config: &'conf Config,
+    path: &String,
+) -> (bool, &'conf JsonType) {
     match config
-    .json_type_overrides
-    .get(path)
-    .unwrap_or(&JsonArray::Infer(JsonType::Infer))
+        .json_type_overrides
+        .get(path)
+        .unwrap_or(&JsonArray::Infer(JsonType::Infer))
     {
         JsonArray::Infer(v) => (false, v),
         JsonArray::Always(v) => (true, v),
